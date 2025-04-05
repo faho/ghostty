@@ -518,7 +518,7 @@ pub fn init(
     };
 
     // The command we're going to execute
-    const command: ?[]const u8 = if (app.first)
+    const command: ?configpkg.Command = if (app.first)
         config.@"initial-command" orelse config.command
     else
         config.command;

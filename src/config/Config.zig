@@ -22,7 +22,6 @@ const inputpkg = @import("../input.zig");
 const terminal = @import("../terminal/main.zig");
 const internal_os = @import("../os/main.zig");
 const cli = @import("../cli.zig");
-const Command = @import("../Command.zig");
 
 const conditional = @import("conditional.zig");
 const Conditional = conditional.Conditional;
@@ -34,6 +33,7 @@ const KeyValue = @import("key.zig").Value;
 const ErrorList = @import("ErrorList.zig");
 const MetricModifier = fontpkg.Metrics.Modifier;
 const help_strings = @import("help_strings");
+pub const Command = @import("command.zig").Command;
 const RepeatableStringMap = @import("RepeatableStringMap.zig");
 pub const Path = @import("path.zig").Path;
 pub const RepeatablePath = @import("path.zig").RepeatablePath;
@@ -691,8 +691,11 @@ palette: Palette = .{},
 ///   * `passwd` entry (user information)
 ///
 /// This can contain additional arguments to run the command with. If additional
-/// arguments are provided, the command will be executed using `/bin/sh -c`.
-/// Ghostty does not do any shell command parsing.
+/// arguments are provided, the command will be executed using `/bin/sh -c`
+/// to offload shell argument expansion. To avoid shell expansion altogether,
+/// prefix the command with `!`, e.g. `!nvim foo`. This will avoid the
+/// roundtrip to `/bin/sh` but will also not support any shell parsing such
+/// as arguments with spaces, filepaths with `~`, globs, etc.
 ///
 /// This command will be used for all new terminal surfaces, i.e. new windows,
 /// tabs, etc. If you want to run a command only for the first terminal surface
@@ -702,7 +705,7 @@ palette: Palette = .{},
 /// arguments. For example, `ghostty -e fish --with --custom --args`.
 /// This flag sets the `initial-command` configuration, see that for more
 /// information.
-command: ?[]const u8 = null,
+command: ?Command = null,
 
 /// This is the same as "command", but only applies to the first terminal
 /// surface created when Ghostty starts. Subsequent terminal surfaces will use
@@ -717,6 +720,10 @@ command: ?[]const u8 = null,
 /// with arguments directly: you can use the `-e` flag. For example: `ghostty -e
 /// fish --with --custom --args`. The `-e` flag automatically forces some
 /// other behaviors as well:
+///
+///   * Disables shell expansion since the input is expected to already
+///     be shell-expanded by the upstream (e.g. the shell used to type in
+///     the `ghostty -e` command).
 ///
 ///   * `gtk-single-instance=false` - This ensures that a new instance is
 ///     launched and the CLI args are respected.
@@ -735,7 +742,7 @@ command: ?[]const u8 = null,
 ///     name your binary appropriately or source the shell integration script
 ///     manually.
 ///
-@"initial-command": ?[]const u8 = null,
+@"initial-command": ?Command = null,
 
 /// Extra environment variables to pass to commands launched in a terminal
 /// surface. The format is `env=KEY=VALUE`.
@@ -3023,7 +3030,7 @@ pub fn finalize(self: *Config) !void {
             // We don't do this in flatpak because SHELL in Flatpak is always
             // set to /bin/sh.
             if (self.command) |cmd|
-                log.info("shell src=config value={s}", .{cmd})
+                log.info("shell src=config value={}", .{cmd})
             else shell_env: {
                 // Flatpak always gets its shell from outside the sandbox
                 if (internal_os.isFlatpak()) break :shell_env;
@@ -3035,7 +3042,9 @@ pub fn finalize(self: *Config) !void {
 
                 if (std.process.getEnvVarOwned(alloc, "SHELL")) |value| {
                     log.info("default shell source=env value={s}", .{value});
-                    self.command = value;
+
+                    const copy = try alloc.dupeZ(u8, value);
+                    self.command = .{ .shell = copy };
 
                     // If we don't need the working directory, then we can exit now.
                     if (!wd_home) break :command;
@@ -3046,7 +3055,7 @@ pub fn finalize(self: *Config) !void {
                 .windows => {
                     if (self.command == null) {
                         log.warn("no default shell found, will default to using cmd", .{});
-                        self.command = "cmd.exe";
+                        self.command = .{ .shell = "cmd.exe" };
                     }
 
                     if (wd_home) {
@@ -3063,7 +3072,7 @@ pub fn finalize(self: *Config) !void {
                     if (self.command == null) {
                         if (pw.shell) |sh| {
                             log.info("default shell src=passwd value={s}", .{sh});
-                            self.command = sh;
+                            self.command = .{ .shell = sh };
                         }
                     }
 
@@ -3145,13 +3154,13 @@ pub fn parseManuallyHook(
 
         // Build up the command. We don't clean this up because we take
         // ownership in our allocator.
-        var command = std.ArrayList(u8).init(alloc);
+        var command: std.ArrayList([:0]const u8) = .init(alloc);
         errdefer command.deinit();
 
         while (iter.next()) |param| {
-            try self._replay_steps.append(alloc, .{ .arg = try alloc.dupe(u8, param) });
-            try command.appendSlice(param);
-            try command.append(' ');
+            const copy = try alloc.dupeZ(u8, param);
+            try self._replay_steps.append(alloc, .{ .arg = copy });
+            try command.append(copy);
         }
 
         if (command.items.len == 0) {
@@ -3167,9 +3176,8 @@ pub fn parseManuallyHook(
             return false;
         }
 
-        self.@"initial-command" = command.items[0 .. command.items.len - 1];
-
         // See "command" docs for the implied configurations and why.
+        self.@"initial-command" = .{ .direct = command.items };
         self.@"gtk-single-instance" = .false;
         self.@"quit-after-last-window-closed" = true;
         self.@"quit-after-last-window-closed-delay" = null;
@@ -3377,6 +3385,16 @@ fn equalField(comptime T: type, old: T, new: T) bool {
         [:0]const u8,
         => return std.mem.eql(u8, old, new),
 
+        []const [:0]const u8,
+        => {
+            if (old.len != new.len) return false;
+            for (old, new) |a, b| {
+                if (!std.mem.eql(u8, a, b)) return false;
+            }
+
+            return true;
+        },
+
         else => {},
     }
 
@@ -3412,6 +3430,8 @@ fn equalField(comptime T: type, old: T, new: T) bool {
         },
 
         .@"union" => |info| {
+            if (@hasDecl(T, "equal")) return old.equal(new);
+
             const tag_type = info.tag_type.?;
             const old_tag = std.meta.activeTag(old);
             const new_tag = std.meta.activeTag(new);
@@ -6620,7 +6640,11 @@ test "parse e: command only" {
 
     var it: TestIterator = .{ .data = &.{"foo"} };
     try testing.expect(!try cfg.parseManuallyHook(alloc, "-e", &it));
-    try testing.expectEqualStrings("foo", cfg.@"initial-command".?);
+
+    const cmd = cfg.@"initial-command".?;
+    try testing.expect(cmd == .direct);
+    try testing.expectEqual(cmd.direct.len, 1);
+    try testing.expectEqualStrings(cmd.direct[0], "foo");
 }
 
 test "parse e: command and args" {
@@ -6631,7 +6655,13 @@ test "parse e: command and args" {
 
     var it: TestIterator = .{ .data = &.{ "echo", "foo", "bar baz" } };
     try testing.expect(!try cfg.parseManuallyHook(alloc, "-e", &it));
-    try testing.expectEqualStrings("echo foo bar baz", cfg.@"initial-command".?);
+
+    const cmd = cfg.@"initial-command".?;
+    try testing.expect(cmd == .direct);
+    try testing.expectEqual(cmd.direct.len, 3);
+    try testing.expectEqualStrings(cmd.direct[0], "echo");
+    try testing.expectEqualStrings(cmd.direct[1], "foo");
+    try testing.expectEqualStrings(cmd.direct[2], "bar baz");
 }
 
 test "clone default" {
